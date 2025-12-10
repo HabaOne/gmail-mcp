@@ -206,16 +206,17 @@ class GmailService:
 
         if not token or not token.valid:
             if token and token.expired and token.refresh_token:
-                logger.info('Refreshing token')
+                logger.info('Refreshing token silently')
                 token.refresh(Request())
+                with open(self.token_path, 'w') as token_file:
+                    token_file.write(token.to_json())
+                    logger.info(f'Refreshed token saved to {self.token_path}')
             else:
-                logger.info('Fetching new token')
-                flow = InstalledAppFlow.from_client_secrets_file(self.creds_file_path, self.scopes)
-                token = flow.run_local_server(port=0)
-
-            with open(self.token_path, 'w') as token_file:
-                token_file.write(token.to_json())
-                logger.info(f'Token saved to {self.token_path}')
+                raise RuntimeError(
+                    "No valid Gmail OAuth token found. "
+                    "Provide a tokens.json created via the frontend OAuth flow "
+                    f"at {self.token_path}"
+                )
 
         return token
 
@@ -369,7 +370,7 @@ class GmailService:
             return {"status": "error", "error_message": str(error)}
     
     async def list_drafts(self) -> list[dict] | str:
-        """Lists all draft emails"""
+        """Lists all draft emails with full content"""
         try:
             results = await asyncio.to_thread(
                 self.service.users().drafts().list(userId="me").execute
@@ -379,26 +380,80 @@ class GmailService:
             draft_list = []
             for draft in drafts:
                 draft_id = draft['id']
-                # Get the draft details to extract subject and recipient
+                # Get the draft details with full format to extract body
                 draft_data = await asyncio.to_thread(
-                    self.service.users().drafts().get(userId="me", id=draft_id).execute
+                    self.service.users().drafts().get(userId="me", id=draft_id, format='full').execute
                 )
                 
                 message = draft_data.get('message', {})
-                headers = message.get('payload', {}).get('headers', [])
+                payload = message.get('payload', {})
+                headers = payload.get('headers', [])
                 
                 subject = next((header['value'] for header in headers if header['name'].lower() == 'subject'), 'No Subject')
                 to = next((header['value'] for header in headers if header['name'].lower() == 'to'), 'No Recipient')
+                from_addr = next((header['value'] for header in headers if header['name'].lower() == 'from'), '')
+                
+                # Extract body content
+                body = None
+                if payload.get('body', {}).get('data'):
+                    # Simple message with body directly in payload
+                    body = urlsafe_b64decode(payload['body']['data']).decode('utf-8', errors='replace')
+                elif payload.get('parts'):
+                    # Multipart message - look for text/plain part
+                    for part in payload['parts']:
+                        if part.get('mimeType') == 'text/plain' and part.get('body', {}).get('data'):
+                            body = urlsafe_b64decode(part['body']['data']).decode('utf-8', errors='replace')
+                            break
+                    # Fallback to text/html if no text/plain
+                    if not body:
+                        for part in payload['parts']:
+                            if part.get('mimeType') == 'text/html' and part.get('body', {}).get('data'):
+                                body = urlsafe_b64decode(part['body']['data']).decode('utf-8', errors='replace')
+                                break
                 
                 draft_list.append({
                     'id': draft_id,
                     'subject': subject,
-                    'to': to
+                    'to': to,
+                    'from': from_addr,
+                    'body': body or '',
+                    'draft_body': body or '',  # For frontend compatibility
+                    'preview': message.get('snippet', ''),  # For frontend compatibility
+                    'snippet': message.get('snippet', ''),
+                    'thread_id': message.get('threadId', ''),
                 })
                 
             return draft_list
         except HttpError as error:
             return f"An HttpError occurred: {str(error)}"
+    
+    async def send_draft(self, draft_id: str) -> dict:
+        """Sends a draft email (moves from drafts to sent)"""
+        try:
+            sent_message = await asyncio.to_thread(
+                self.service.users().drafts().send(userId="me", body={'id': draft_id}).execute
+            )
+            logger.info(f"Draft sent: {draft_id} -> Message ID: {sent_message.get('id')}")
+            return {
+                "status": "success",
+                "message_id": sent_message.get('id'),
+                "thread_id": sent_message.get('threadId'),
+            }
+        except HttpError as error:
+            logger.error(f"Failed to send draft {draft_id}: {error}")
+            return {"status": "error", "error_message": str(error)}
+
+    async def delete_draft(self, draft_id: str) -> dict:
+        """Deletes a draft email permanently"""
+        try:
+            await asyncio.to_thread(
+                self.service.users().drafts().delete(userId="me", id=draft_id).execute
+            )
+            logger.info(f"Draft deleted: {draft_id}")
+            return {"status": "success", "draft_id": draft_id}
+        except HttpError as error:
+            logger.error(f"Failed to delete draft {draft_id}: {error}")
+            return {"status": "error", "error_message": str(error)}
     
     async def list_labels(self) -> list[dict] | str:
         """Lists all labels in the user's mailbox"""
@@ -1309,6 +1364,34 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
                 },
             ),
             types.Tool(
+                name="send-draft",
+                description="Sends a draft email (moves from drafts to sent folder)",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "draft_id": {
+                            "type": "string",
+                            "description": "Draft ID to send",
+                        },
+                    },
+                    "required": ["draft_id"],
+                },
+            ),
+            types.Tool(
+                name="delete-draft",
+                description="Deletes a draft email permanently",
+                inputSchema={
+                    "type": "object",
+                    "properties": {
+                        "draft_id": {
+                            "type": "string",
+                            "description": "Draft ID to delete",
+                        },
+                    },
+                    "required": ["draft_id"],
+                },
+            ),
+            types.Tool(
                 name="list-labels",
                 description="Lists all labels in the user's mailbox",
                 inputSchema={
@@ -1710,6 +1793,26 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
         elif name == "list-drafts":
             drafts = await gmail_service.list_drafts()
             return [types.TextContent(type="text", text=str(drafts), artifact={"type": "json", "data": drafts})]
+        elif name == "send-draft":
+            draft_id = arguments.get("draft_id")
+            if not draft_id:
+                raise ValueError("Missing draft_id parameter")
+            send_response = await gmail_service.send_draft(draft_id)
+            if send_response["status"] == "success":
+                response_text = f"Draft sent successfully. Message ID: {send_response['message_id']}"
+            else:
+                response_text = f"Failed to send draft: {send_response['error_message']}"
+            return [types.TextContent(type="text", text=response_text)]
+        elif name == "delete-draft":
+            draft_id = arguments.get("draft_id")
+            if not draft_id:
+                raise ValueError("Missing draft_id parameter")
+            delete_response = await gmail_service.delete_draft(draft_id)
+            if delete_response["status"] == "success":
+                response_text = f"Draft deleted successfully. Draft ID: {delete_response['draft_id']}"
+            else:
+                response_text = f"Failed to delete draft: {delete_response['error_message']}"
+            return [types.TextContent(type="text", text=response_text)]
         elif name == "list-labels":
             labels = await gmail_service.list_labels()
             return [types.TextContent(type="text", text=str(labels), artifact={"type": "json", "data": labels})]
