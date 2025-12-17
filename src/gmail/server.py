@@ -181,10 +181,13 @@ def decode_mime_header(header: str) -> str:
 
 
 # Gmail OAuth Scopes - MUST match what's configured in Google Cloud Console
+# Gmail OAuth Scopes - MUST be consistent across Frontend, Backend, and Gmail MCP
+# Using gmail.modify which includes read, compose, send, modify, and delete
 GMAIL_SCOPES = [
     "https://www.googleapis.com/auth/gmail.modify",
     "https://www.googleapis.com/auth/gmail.compose",
     "https://www.googleapis.com/auth/gmail.insert",
+    "https://www.googleapis.com/auth/userinfo.email",
 ]
 
 
