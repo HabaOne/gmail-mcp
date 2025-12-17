@@ -180,10 +180,11 @@ def decode_mime_header(header: str) -> str:
     return decoded_string
 
 
-# Gmail OAuth Scopes - MUST match what's used in OAuth flow
-# Using gmail.modify provides read/write/send/delete access to messages and drafts
+# Gmail OAuth Scopes - MUST match what's configured in Google Cloud Console
 GMAIL_SCOPES = [
     "https://www.googleapis.com/auth/gmail.modify",
+    "https://www.googleapis.com/auth/gmail.compose",
+    "https://www.googleapis.com/auth/gmail.insert",
 ]
 
 
