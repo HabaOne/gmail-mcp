@@ -10,6 +10,7 @@ dependencies = [
     "google-api-python-client>=2.156.0",
     "google-auth-httplib2>=0.2.0",
     "google-auth-oauthlib>=1.2.1",
+    "filelock>=3.13.0",
 ]
 [build-system]
 requires = [ "hatchling",]

@@ -21,6 +21,7 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+import filelock
 
 
 # Configure logging
@@ -179,11 +180,21 @@ def decode_mime_header(header: str) -> str:
     return decoded_string
 
 
+# Gmail OAuth Scopes - MUST match what's used in OAuth flow
+# Using gmail.modify provides read/write/send/delete access to messages and drafts
+GMAIL_SCOPES = [
+    "https://www.googleapis.com/auth/gmail.modify",
+]
+
+
 class GmailService:
     def __init__(self,
                  creds_file_path: str,
                  token_path: str,
-                 scopes: list[str] = ['https://www.googleapis.com/auth/gmail.modify']):
+                 scopes: list[str] | None = None):
+        # Use centralized scopes by default
+        if scopes is None:
+            scopes = GMAIL_SCOPES
         logger.info(f"Initializing GmailService with creds file: {creds_file_path}")
         self.creds_file_path = creds_file_path
         self.token_path = token_path
@@ -196,29 +207,38 @@ class GmailService:
         logger.info(f"User email retrieved: {self.user_email}")
 
     def _get_token(self) -> Credentials:
-        """Get or refresh Google API token"""
+        """Get or refresh Google API token with file locking to prevent race conditions"""
+        
+        # Use file lock to prevent multiple processes from refreshing token simultaneously
+        lock_path = self.token_path + ".lock"
+        lock = filelock.FileLock(lock_path, timeout=30)
+        
+        try:
+            with lock:
+                token = None
+            
+                if os.path.exists(self.token_path):
+                    logger.info('Loading token from file')
+                    token = Credentials.from_authorized_user_file(self.token_path, self.scopes)
 
-        token = None
-    
-        if os.path.exists(self.token_path):
-            logger.info('Loading token from file')
-            token = Credentials.from_authorized_user_file(self.token_path, self.scopes)
+                if not token or not token.valid:
+                    if token and token.expired and token.refresh_token:
+                        logger.info('Refreshing token silently (with lock)')
+                        token.refresh(Request())
+                        with open(self.token_path, 'w') as token_file:
+                            token_file.write(token.to_json())
+                            logger.info(f'Refreshed token saved to {self.token_path}')
+                    else:
+                        raise RuntimeError(
+                            "No valid Gmail OAuth token found. "
+                            "Provide a tokens.json created via the frontend OAuth flow "
+                            f"at {self.token_path}"
+                        )
 
-        if not token or not token.valid:
-            if token and token.expired and token.refresh_token:
-                logger.info('Refreshing token silently')
-                token.refresh(Request())
-                with open(self.token_path, 'w') as token_file:
-                    token_file.write(token.to_json())
-                    logger.info(f'Refreshed token saved to {self.token_path}')
-            else:
-                raise RuntimeError(
-                    "No valid Gmail OAuth token found. "
-                    "Provide a tokens.json created via the frontend OAuth flow "
-                    f"at {self.token_path}"
-                )
-
-        return token
+                return token
+        except filelock.Timeout:
+            logger.error(f"Timeout waiting for token lock at {lock_path}")
+            raise RuntimeError("Token refresh lock timeout - another process may be stuck")
 
     def _get_service(self) -> Any:
         """Initialize Gmail API service"""
