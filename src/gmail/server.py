@@ -443,8 +443,8 @@ class GmailService:
             logger.error(f"Failed to send draft {draft_id}: {error}")
             return {"status": "error", "error_message": str(error)}
 
-    async def delete_draft(self, draft_id: str) -> dict:
-        """Deletes a draft email permanently"""
+    async def delete_draft(self, draft_id: str) -> str:
+        """Permanently deletes a draft email"""
         try:
             await asyncio.to_thread(
                 self.service.users().drafts().delete(userId="me", id=draft_id).execute
@@ -454,6 +454,8 @@ class GmailService:
         except HttpError as error:
             logger.error(f"Failed to delete draft {draft_id}: {error}")
             return {"status": "error", "error_message": str(error)}
+        except HttpError as error:
+            return f"An HttpError occurred: {str(error)}"
     
     async def list_labels(self) -> list[dict] | str:
         """Lists all labels in the user's mailbox"""
@@ -1379,13 +1381,13 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
             ),
             types.Tool(
                 name="delete-draft",
-                description="Deletes a draft email permanently",
+                description="Permanently deletes a draft email",
                 inputSchema={
                     "type": "object",
                     "properties": {
                         "draft_id": {
                             "type": "string",
-                            "description": "Draft ID to delete",
+                            "description": "The ID of the draft to delete",
                         },
                     },
                     "required": ["draft_id"],
