@@ -21,7 +21,6 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-import filelock
 
 
 # Configure logging
@@ -180,25 +179,11 @@ def decode_mime_header(header: str) -> str:
     return decoded_string
 
 
-# Gmail OAuth Scopes - MUST match what's configured in Google Cloud Console
-# Gmail OAuth Scopes - MUST be consistent across Frontend, Backend, and Gmail MCP
-# Using gmail.modify which includes read, compose, send, modify, and delete
-GMAIL_SCOPES = [
-    "https://www.googleapis.com/auth/gmail.modify",
-    "https://www.googleapis.com/auth/gmail.compose",
-    "https://www.googleapis.com/auth/gmail.insert",
-    "https://www.googleapis.com/auth/userinfo.email",
-]
-
-
 class GmailService:
     def __init__(self,
                  creds_file_path: str,
                  token_path: str,
-                 scopes: list[str] | None = None):
-        # Use centralized scopes by default
-        if scopes is None:
-            scopes = GMAIL_SCOPES
+                 scopes: list[str] = ['https://www.googleapis.com/auth/gmail.modify']):
         logger.info(f"Initializing GmailService with creds file: {creds_file_path}")
         self.creds_file_path = creds_file_path
         self.token_path = token_path
@@ -211,38 +196,29 @@ class GmailService:
         logger.info(f"User email retrieved: {self.user_email}")
 
     def _get_token(self) -> Credentials:
-        """Get or refresh Google API token with file locking to prevent race conditions"""
-        
-        # Use file lock to prevent multiple processes from refreshing token simultaneously
-        lock_path = self.token_path + ".lock"
-        lock = filelock.FileLock(lock_path, timeout=30)
-        
-        try:
-            with lock:
-                token = None
-            
-                if os.path.exists(self.token_path):
-                    logger.info('Loading token from file')
-                    token = Credentials.from_authorized_user_file(self.token_path, self.scopes)
+        """Get or refresh Google API token"""
 
-                if not token or not token.valid:
-                    if token and token.expired and token.refresh_token:
-                        logger.info('Refreshing token silently (with lock)')
-                        token.refresh(Request())
-                        with open(self.token_path, 'w') as token_file:
-                            token_file.write(token.to_json())
-                            logger.info(f'Refreshed token saved to {self.token_path}')
-                    else:
-                        raise RuntimeError(
-                            "No valid Gmail OAuth token found. "
-                            "Provide a tokens.json created via the frontend OAuth flow "
-                            f"at {self.token_path}"
-                        )
+        token = None
+    
+        if os.path.exists(self.token_path):
+            logger.info('Loading token from file')
+            token = Credentials.from_authorized_user_file(self.token_path, self.scopes)
 
-                return token
-        except filelock.Timeout:
-            logger.error(f"Timeout waiting for token lock at {lock_path}")
-            raise RuntimeError("Token refresh lock timeout - another process may be stuck")
+        if not token or not token.valid:
+            if token and token.expired and token.refresh_token:
+                logger.info('Refreshing token silently')
+                token.refresh(Request())
+                with open(self.token_path, 'w') as token_file:
+                    token_file.write(token.to_json())
+                    logger.info(f'Refreshed token saved to {self.token_path}')
+            else:
+                raise RuntimeError(
+                    "No valid Gmail OAuth token found. "
+                    "Provide a tokens.json created via the frontend OAuth flow "
+                    f"at {self.token_path}"
+                )
+
+        return token
 
     def _get_service(self) -> Any:
         """Initialize Gmail API service"""
@@ -259,17 +235,65 @@ class GmailService:
         user_email = profile.get('emailAddress', '')
         return user_email
     
-    async def send_email(self, recipient_id: str, subject: str, message: str,) -> dict:
-        """Creates and sends an email message"""
+    async def send_email(self, recipient_id: str, subject: str, message: str, attachments: list[dict] | None = None) -> dict:
+        """Creates and sends an email message with optional attachments.
+        
+        Args:
+            recipient_id: Recipient email address
+            subject: Email subject
+            message: Email body text
+            attachments: Optional list of attachment dicts with 'path' (file path) and optional 'filename'
+        """
         try:
-            message_obj = EmailMessage()
-            message_obj.set_content(message)
-            
-            message_obj['To'] = recipient_id
-            message_obj['From'] = self.user_email
-            message_obj['Subject'] = subject
+            if attachments:
+                # Use MIME multipart for attachments
+                from email.mime.multipart import MIMEMultipart
+                from email.mime.text import MIMEText
+                from email.mime.base import MIMEBase
+                from email import encoders
+                import mimetypes
+                
+                message_obj = MIMEMultipart()
+                message_obj['To'] = recipient_id
+                message_obj['From'] = self.user_email
+                message_obj['Subject'] = subject
+                
+                # Attach the body text
+                message_obj.attach(MIMEText(message, 'plain'))
+                
+                # Attach files
+                for att in attachments:
+                    file_path = att.get('path')
+                    filename = att.get('filename') or os.path.basename(file_path)
+                    
+                    if not os.path.exists(file_path):
+                        logger.warning(f"Attachment file not found: {file_path}")
+                        continue
+                    
+                    # Guess the MIME type
+                    mime_type, _ = mimetypes.guess_type(file_path)
+                    if mime_type is None:
+                        mime_type = 'application/octet-stream'
+                    main_type, sub_type = mime_type.split('/', 1)
+                    
+                    with open(file_path, 'rb') as f:
+                        part = MIMEBase(main_type, sub_type)
+                        part.set_payload(f.read())
+                    
+                    encoders.encode_base64(part)
+                    part.add_header('Content-Disposition', 'attachment', filename=filename)
+                    message_obj.attach(part)
+                
+                encoded_message = base64.urlsafe_b64encode(message_obj.as_bytes()).decode()
+            else:
+                # Simple email without attachments
+                message_obj = EmailMessage()
+                message_obj.set_content(message)
+                message_obj['To'] = recipient_id
+                message_obj['From'] = self.user_email
+                message_obj['Subject'] = subject
+                encoded_message = base64.urlsafe_b64encode(message_obj.as_bytes()).decode()
 
-            encoded_message = base64.urlsafe_b64encode(message_obj.as_bytes()).decode()
             create_message = {'raw': encoded_message}
             
             send_message = await asyncio.to_thread(
@@ -372,17 +396,65 @@ class GmailService:
         except HttpError as error:
             return f"An HttpError occurred: {str(error)}"
     
-    async def create_draft(self, recipient_id: str, subject: str, message: str) -> dict:
-        """Creates a draft email message"""
+    async def create_draft(self, recipient_id: str, subject: str, message: str, attachments: list[dict] | None = None) -> dict:
+        """Creates a draft email message with optional attachments.
+        
+        Args:
+            recipient_id: Recipient email address
+            subject: Email subject
+            message: Email body text
+            attachments: Optional list of attachment dicts with 'path' (file path) and optional 'filename'
+        """
         try:
-            message_obj = EmailMessage()
-            message_obj.set_content(message)
-            
-            message_obj['To'] = recipient_id
-            message_obj['From'] = self.user_email
-            message_obj['Subject'] = subject
+            if attachments:
+                # Use MIME multipart for attachments
+                from email.mime.multipart import MIMEMultipart
+                from email.mime.text import MIMEText
+                from email.mime.base import MIMEBase
+                from email import encoders
+                import mimetypes
+                
+                message_obj = MIMEMultipart()
+                message_obj['To'] = recipient_id
+                message_obj['From'] = self.user_email
+                message_obj['Subject'] = subject
+                
+                # Attach the body text
+                message_obj.attach(MIMEText(message, 'plain'))
+                
+                # Attach files
+                for att in attachments:
+                    file_path = att.get('path')
+                    filename = att.get('filename') or os.path.basename(file_path)
+                    
+                    if not os.path.exists(file_path):
+                        logger.warning(f"Attachment file not found: {file_path}")
+                        continue
+                    
+                    # Guess the MIME type
+                    mime_type, _ = mimetypes.guess_type(file_path)
+                    if mime_type is None:
+                        mime_type = 'application/octet-stream'
+                    main_type, sub_type = mime_type.split('/', 1)
+                    
+                    with open(file_path, 'rb') as f:
+                        part = MIMEBase(main_type, sub_type)
+                        part.set_payload(f.read())
+                    
+                    encoders.encode_base64(part)
+                    part.add_header('Content-Disposition', 'attachment', filename=filename)
+                    message_obj.attach(part)
+                
+                encoded_message = base64.urlsafe_b64encode(message_obj.as_bytes()).decode()
+            else:
+                # Simple email without attachments
+                message_obj = EmailMessage()
+                message_obj.set_content(message)
+                message_obj['To'] = recipient_id
+                message_obj['From'] = self.user_email
+                message_obj['Subject'] = subject
+                encoded_message = base64.urlsafe_b64encode(message_obj.as_bytes()).decode()
 
-            encoded_message = base64.urlsafe_b64encode(message_obj.as_bytes()).decode()
             create_message = {'raw': encoded_message}
             
             draft = await asyncio.to_thread(
@@ -1270,7 +1342,7 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
         return [
             types.Tool(
                 name="send-email",
-                description="""Sends email to recipient. 
+                description="""Sends email to recipient with optional file attachments. 
                 Do not use if user only asked to draft email. 
                 Drafts must be approved before sending.""",
                 inputSchema={
@@ -1287,6 +1359,24 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
                         "message": {
                             "type": "string",
                             "description": "Email content text",
+                        },
+                        "attachments": {
+                            "type": "array",
+                            "description": "Optional list of file attachments",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "path": {
+                                        "type": "string",
+                                        "description": "Absolute file path to attach",
+                                    },
+                                    "filename": {
+                                        "type": "string",
+                                        "description": "Optional display filename (defaults to original filename)",
+                                    },
+                                },
+                                "required": ["path"],
+                            },
                         },
                     },
                     "required": ["recipient_id", "subject", "message"],
@@ -1360,7 +1450,7 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
             ),
             types.Tool(
                 name="create-draft",
-                description="Creates a draft email without sending it",
+                description="Creates a draft email without sending it, with optional file attachments",
                 inputSchema={
                     "type": "object",
                     "properties": {
@@ -1375,6 +1465,24 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
                         "message": {
                             "type": "string",
                             "description": "Email content text",
+                        },
+                        "attachments": {
+                            "type": "array",
+                            "description": "Optional list of file attachments",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "path": {
+                                        "type": "string",
+                                        "description": "Absolute file path to attach",
+                                    },
+                                    "filename": {
+                                        "type": "string",
+                                        "description": "Optional display filename (defaults to original filename)",
+                                    },
+                                },
+                                "required": ["path"],
+                            },
                         },
                     },
                     "required": ["recipient_id", "subject", "message"],
@@ -1754,6 +1862,7 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
             message = arguments.get("message")
             if not message:
                 raise ValueError("Missing message parameter")
+            attachments = arguments.get("attachments")
                 
             # Extract subject and message content
             email_lines = message.split('\n')
@@ -1763,7 +1872,7 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
             else:
                 message_content = message
                 
-            send_response = await gmail_service.send_email(recipient, subject, message_content)
+            send_response = await gmail_service.send_email(recipient, subject, message_content, attachments)
             
             if send_response["status"] == "success":
                 response_text = f"Email sent successfully. Message ID: {send_response['message_id']}"
@@ -1808,9 +1917,10 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
             recipient_id = arguments.get("recipient_id")
             subject = arguments.get("subject")
             message = arguments.get("message")
+            attachments = arguments.get("attachments")
             if not recipient_id or not subject or not message:
                 raise ValueError("Missing required parameters for creating a draft")
-            draft_response = await gmail_service.create_draft(recipient_id, subject, message)
+            draft_response = await gmail_service.create_draft(recipient_id, subject, message, attachments)
             if draft_response["status"] == "success":
                 response_text = f"Draft created successfully. Draft ID: {draft_response['draft_id']}"
             else:
