@@ -1,5 +1,6 @@
 from typing import Any
 import argparse
+import json
 import os
 import asyncio
 import logging
@@ -464,64 +465,123 @@ class GmailService:
             return {"status": "success", "draft_id": draft["id"]}
         except HttpError as error:
             return {"status": "error", "error_message": str(error)}
-    
+
+    @staticmethod
+    def _header_value(headers: list[Any], name: str) -> str:
+        want = name.lower()
+        for header in headers:
+            if not isinstance(header, dict):
+                continue
+            hname = header.get("name")
+            if isinstance(hname, str) and hname.lower() == want:
+                val = header.get("value")
+                return val if isinstance(val, str) else (str(val) if val is not None else "")
+        return ""
+
+    @staticmethod
+    def _body_from_parts_tree(parts: list[Any], prefer_plain: bool) -> str | None:
+        """Walk nested multipart payloads (Gmail may return multiple levels)."""
+        if not parts:
+            return None
+        mime_order = ("text/plain", "text/html") if prefer_plain else ("text/html", "text/plain")
+        for mime in mime_order:
+            for part in parts:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("mimeType") == mime and part.get("body", {}).get("data"):
+                    try:
+                        return urlsafe_b64decode(part["body"]["data"]).decode(
+                            "utf-8", errors="replace"
+                        )
+                    except (ValueError, KeyError, TypeError) as e:
+                        logger.warning("Failed to decode draft part (%s): %s", mime, e)
+                nested = part.get("parts")
+                if isinstance(nested, list):
+                    got = GmailService._body_from_parts_tree(nested, prefer_plain)
+                    if got:
+                        return got
+        return None
+
     async def list_drafts(self) -> list[dict] | str:
         """Lists all draft emails with full content"""
         try:
             results = await asyncio.to_thread(
                 self.service.users().drafts().list(userId="me").execute
             )
-            drafts = results.get('drafts', [])
-            
-            draft_list = []
+            drafts = results.get("drafts", []) or []
+
+            draft_list: list[dict[str, Any]] = []
             for draft in drafts:
-                draft_id = draft['id']
-                # Get the draft details with full format to extract body
-                draft_data = await asyncio.to_thread(
-                    self.service.users().drafts().get(userId="me", id=draft_id, format='full').execute
+                if not isinstance(draft, dict):
+                    logger.warning("Skipping draft entry with unexpected shape: %r", draft)
+                    continue
+                draft_id = draft.get("id")
+                if not draft_id:
+                    logger.warning("Skipping draft without id: %r", draft)
+                    continue
+                try:
+                    draft_data = await asyncio.to_thread(
+                        self.service.users()
+                        .drafts()
+                        .get(userId="me", id=draft_id, format="full")
+                        .execute
+                    )
+                except HttpError as e:
+                    logger.warning("Could not load draft %s: %s", draft_id, e)
+                    continue
+                except Exception as e:
+                    logger.warning("Unexpected error loading draft %s: %s", draft_id, e)
+                    continue
+
+                if not isinstance(draft_data, dict):
+                    continue
+
+                message = draft_data.get("message", {}) or {}
+                payload = message.get("payload", {}) or {}
+                headers = payload.get("headers", []) or []
+                if not isinstance(headers, list):
+                    headers = []
+
+                subject = self._header_value(headers, "subject") or "No Subject"
+                to = self._header_value(headers, "to") or "No Recipient"
+                from_addr = self._header_value(headers, "from")
+
+                body: str | None = None
+                try:
+                    if payload.get("body", {}).get("data"):
+                        body = urlsafe_b64decode(payload["body"]["data"]).decode(
+                            "utf-8", errors="replace"
+                        )
+                    elif payload.get("parts"):
+                        parts = payload.get("parts")
+                        if isinstance(parts, list):
+                            body = self._body_from_parts_tree(parts, prefer_plain=True)
+                            if not body:
+                                body = self._body_from_parts_tree(parts, prefer_plain=False)
+                except (ValueError, KeyError, TypeError) as e:
+                    logger.warning("Failed to extract body for draft %s: %s", draft_id, e)
+                    body = None
+
+                draft_list.append(
+                    {
+                        "id": draft_id,
+                        "subject": subject,
+                        "to": to,
+                        "from": from_addr,
+                        "body": body or "",
+                        "draft_body": body or "",
+                        "preview": message.get("snippet", "") or "",
+                        "snippet": message.get("snippet", "") or "",
+                        "thread_id": message.get("threadId", "") or "",
+                    }
                 )
-                
-                message = draft_data.get('message', {})
-                payload = message.get('payload', {})
-                headers = payload.get('headers', [])
-                
-                subject = next((header['value'] for header in headers if header['name'].lower() == 'subject'), 'No Subject')
-                to = next((header['value'] for header in headers if header['name'].lower() == 'to'), 'No Recipient')
-                from_addr = next((header['value'] for header in headers if header['name'].lower() == 'from'), '')
-                
-                # Extract body content
-                body = None
-                if payload.get('body', {}).get('data'):
-                    # Simple message with body directly in payload
-                    body = urlsafe_b64decode(payload['body']['data']).decode('utf-8', errors='replace')
-                elif payload.get('parts'):
-                    # Multipart message - look for text/plain part
-                    for part in payload['parts']:
-                        if part.get('mimeType') == 'text/plain' and part.get('body', {}).get('data'):
-                            body = urlsafe_b64decode(part['body']['data']).decode('utf-8', errors='replace')
-                            break
-                    # Fallback to text/html if no text/plain
-                    if not body:
-                        for part in payload['parts']:
-                            if part.get('mimeType') == 'text/html' and part.get('body', {}).get('data'):
-                                body = urlsafe_b64decode(part['body']['data']).decode('utf-8', errors='replace')
-                                break
-                
-                draft_list.append({
-                    'id': draft_id,
-                    'subject': subject,
-                    'to': to,
-                    'from': from_addr,
-                    'body': body or '',
-                    'draft_body': body or '',  # For frontend compatibility
-                    'preview': message.get('snippet', ''),  # For frontend compatibility
-                    'snippet': message.get('snippet', ''),
-                    'thread_id': message.get('threadId', ''),
-                })
-                
+
             return draft_list
         except HttpError as error:
             return f"An HttpError occurred: {str(error)}"
+        except Exception as e:
+            logger.exception("list_drafts failed with an unexpected error")
+            return f"An error occurred while listing drafts: {str(e)}"
     
     async def send_draft(self, draft_id: str) -> dict:
         """Sends a draft email (moves from drafts to sent)"""
@@ -550,8 +610,6 @@ class GmailService:
         except HttpError as error:
             logger.error(f"Failed to delete draft {draft_id}: {error}")
             return {"status": "error", "error_message": str(error)}
-        except HttpError as error:
-            return f"An HttpError occurred: {str(error)}"
     
     async def list_labels(self) -> list[dict] | str:
         """Lists all labels in the user's mailbox"""
@@ -1927,8 +1985,25 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
                 response_text = f"Failed to create draft: {draft_response['error_message']}"
             return [types.TextContent(type="text", text=response_text)]
         elif name == "list-drafts":
-            drafts = await gmail_service.list_drafts()
-            return [types.TextContent(type="text", text=str(drafts), artifact={"type": "json", "data": drafts})]
+            raw = await gmail_service.list_drafts()
+            if isinstance(raw, str):
+                envelope = {"error": raw, "drafts": []}
+                text_payload = json.dumps(envelope, ensure_ascii=False)
+                return [
+                    types.TextContent(
+                        type="text",
+                        text=text_payload,
+                        artifact={"type": "json", "data": envelope},
+                    )
+                ]
+            text_payload = json.dumps(raw, ensure_ascii=False)
+            return [
+                types.TextContent(
+                    type="text",
+                    text=text_payload,
+                    artifact={"type": "json", "data": raw},
+                )
+            ]
         elif name == "send-draft":
             draft_id = arguments.get("draft_id")
             if not draft_id:
