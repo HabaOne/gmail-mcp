@@ -503,10 +503,14 @@ class GmailService:
         return None
 
     async def list_drafts(self) -> list[dict] | str:
-        """Lists all draft emails with full content"""
+        """Lists draft emails with headers and snippet (metadata only).
+
+        Uses Gmail ``format=metadata`` per draft so responses stay small and fast.
+        Full MIME bodies are not loaded here (avoids huge MCP payloads / stdio drops).
+        """
         try:
             results = await asyncio.to_thread(
-                self.service.users().drafts().list(userId="me").execute
+                self.service.users().drafts().list(userId="me", maxResults=100).execute
             )
             drafts = results.get("drafts", []) or []
 
@@ -523,7 +527,7 @@ class GmailService:
                     draft_data = await asyncio.to_thread(
                         self.service.users()
                         .drafts()
-                        .get(userId="me", id=draft_id, format="full")
+                        .get(userId="me", id=draft_id, format="metadata")
                         .execute
                     )
                 except HttpError as e:
@@ -546,21 +550,7 @@ class GmailService:
                 to = self._header_value(headers, "to") or "No Recipient"
                 from_addr = self._header_value(headers, "from")
 
-                body: str | None = None
-                try:
-                    if payload.get("body", {}).get("data"):
-                        body = urlsafe_b64decode(payload["body"]["data"]).decode(
-                            "utf-8", errors="replace"
-                        )
-                    elif payload.get("parts"):
-                        parts = payload.get("parts")
-                        if isinstance(parts, list):
-                            body = self._body_from_parts_tree(parts, prefer_plain=True)
-                            if not body:
-                                body = self._body_from_parts_tree(parts, prefer_plain=False)
-                except (ValueError, KeyError, TypeError) as e:
-                    logger.warning("Failed to extract body for draft %s: %s", draft_id, e)
-                    body = None
+                snippet = (message.get("snippet", "") or "").strip()
 
                 draft_list.append(
                     {
@@ -568,10 +558,10 @@ class GmailService:
                         "subject": subject,
                         "to": to,
                         "from": from_addr,
-                        "body": body or "",
-                        "draft_body": body or "",
-                        "preview": message.get("snippet", "") or "",
-                        "snippet": message.get("snippet", "") or "",
+                        "body": "",
+                        "draft_body": "",
+                        "preview": snippet,
+                        "snippet": snippet,
                         "thread_id": message.get("threadId", "") or "",
                     }
                 )
@@ -1548,7 +1538,7 @@ Note: Archiving in Gmail means removing the email from your inbox while keeping 
             ),
             types.Tool(
                 name="list-drafts",
-                description="Lists all draft emails",
+                description="Lists draft emails (subject, recipients, snippet). Full body is not included.",
                 inputSchema={
                     "type": "object",
                     "properties": {},
